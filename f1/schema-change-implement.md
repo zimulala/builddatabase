@@ -82,7 +82,7 @@
 1.   start worker 中的定时器到达时间。
 2.   开启一个事务，检查发现本节点为 owner 角色。
 3.   从 KV 层获取第一个 job（假设就是 TiDB Server 1 之前放入的 job），判断此 job 的类型并对它做相应的处理。
-4.   此处 job 的类型为 add column，然后流程到达图中 get column information 步骤。
+4.   此处 job 的类型为 add column，然后流程到达图中 get column information 步骤。  
 &emsp;&emsp;a.取对应 table info（主要通过 job 中 schemaID 和 tableID 获取），然后确定添加的 column 在原先的表中不存在或者为不可见状态。
 &emsp;&emsp;b.如果新添加的 column 在原先表中不存在，那么将新 column 信息关联到 table info。
 &emsp;&emsp;c.在前面两个步骤中发生某些情况会将此 job 标记为 cancel 状态，并返回 error，到达图中 returns error 流程。比如发现对应的数据库、数据表的状态为不存在或者不可见（即它的状态不为 public），发现此 column 已存在并为可见状态等一些错误，这里就不全部列举了。
@@ -92,7 +92,7 @@
 8.   在执行前面的操作时消耗了一定的时间，所以这里将更新 owner 的 last update timestamp 为当前时间（防止经常将 owner 角色在不同服务器中切换），并提交事务。
 9.   循环执行步骤2、 3、 4.a、5、 6、 7 、8，不过将6中的状态由 delete only 改为 write only。
 10.   循环执行步骤2、 3、 4.a、5、 6、 7 、8，不过将6中的状态由 write only 改为 write  reorganization。
-11.   循环执行步骤2、 3、 4.a、5，获取当前 store 的快照版本，然后给新添加的列填写数据。通过应版本下需要得到的表的所有 handle（相当于 rowID），出于内存和性能的综合考量，此处处理为批量获取。然后针对每行新添加的列做数据填充，具体操作如下（下面的操作都会在一个事务中完成）：
+11.   循环执行步骤2、 3、 4.a、5，获取当前 store 的快照版本，然后给新添加的列填写数据。通过应版本下需要得到的表的所有 handle（相当于 rowID），出于内存和性能的综合考量，此处处理为批量获取。然后针对每行新添加的列做数据填充，具体操作如下（下面的操作都会在一个事务中完成）：  
 &emsp;&emsp;a.用先前取到的 handle 确定对应行存在，如果不存在则不对此行做任何操作。
 &emsp;&emsp;b.如果存在，通过 handle 和 新添加的 columnID 拼成的 key 获取对应列。获取的值不为空则不对此行做任何操作。
 &emsp;&emsp;c.如果值为空，则通过对应的新添加行的信息获取默认值，并存储到 KV 层。
@@ -107,12 +107,13 @@ start job 的定时检查触发后，会检查 job history queue 是否有之前
 对删除数据库，删除数据表等减少一个状态，即2倍 lease 的等待时间，以及删除数据库或者数据表中大量数据所消耗的时间。原本对于删除操作的状态变化是 public -> write only -> delete only -> delete reorganization -> none，优化的处理是去掉 delete reorganization 状态，并把此状态需要处理的元数据的操作放到 delete only 状态时，把具体删除数据的操作放到后台处理，然后直接把状态标为 none。  
 这相对原来设计的主要有两点不同，下面介绍下做如此优化是否对数据完整性和一致性有影响。  
 *   将删除具体数据这个操作异步处理了。因为在把数据放到后台删除前，此数据表（假设这里执行的是删除表操作，后面提到也这么假设）的元数据已经删除，对外已经不能访问到此表了，那么对于它们下面的具体数据就更不能访问了。这里可能有人会有疑问那异步删除模块是怎么访问的具体数据的，将元数据事先存在 job 信息中，就这么简单。只要保证先删除元数据（保证此事务提交成功）再异步删除具体数据是不会有问题的。
-*   去掉了 delete reorganization 状态。本来 delete only 以及之前的状态都没做修改所以必然是没问题的，那么就是考虑 none 这个状态，即当整个系统由于接到变更信息先后不同处于 delete only 以及 none 这两个状态。那么就分析在这个状态下有客户端希望对此表进行一些操作。
-&emsp;&emsp;*   客户端访问表处于 none 状态的 TiDB Server。这个其实更没有做优化前是一致的，即访问不到此表，这边不过多解释。
-&emsp;&emsp;*   客户端访问表处于 delete only 状态的 TiDB Server。此时客户端对此表做读写操作会失败，因为 delete only 状态对它们都不可见。
+*   去掉了 delete reorganization 状态。本来 delete only 以及之前的状态都没做修改所以必然是没问题的，那么就是考虑 none 这个状态，即当整个系统由于接到变更信息先后不同处于 delete only 以及 none 这两个状态。那么就分析在这个状态下有客户端希望对此表进行一些操作。  
+&emsp;&emsp; *   客户端访问表处于 none 状态的 TiDB Server。这个其实更没有做优化前是一致的，即访问不到此表，这边不过多解释。
+&emsp;&emsp; *   客户端访问表处于 delete only 状态的 TiDB Server。此时客户端对此表做读写操作会失败，因为 delete only 状态对它们都不可见。
 
 ###### 实现
   此优化对于原先的代码逻辑基本没有变化，除了对于删除操作（目前还只是删除数据库和表操作）在其处于 delete only 状态时，就会把元数据删除，而对起表中具体数据的删除则推迟到后台运行，然后结束 DDL job。放到后台运行的任务的流程跟之前处理任务的流程类似，详细过程如下：
+
 1.   在图4中判定 finish 操作为 true 后，判断如果是可以放在后台运行（暂时还只是删除数据库和表的任务），那么将其封装成 background job 放入 background job queue， 并通知本机后台的 worker 将其处理。
 2.   后台 job 也有对应的 owner，假设本机的 backgroundworker 就是 background owner 角色，那么他将从 background job queue 中取出第一个 background job， 然后执行对应类型的操作（删除表中具体的数据）。
 如果执行完成，那么从 background job queue 中将此 job 删除，并放入 background job history queue 中。
