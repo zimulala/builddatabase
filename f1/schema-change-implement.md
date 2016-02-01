@@ -10,13 +10,13 @@
 由于 bootstrap 操作时需要修改 DDL，这样就产生了鸡生蛋，蛋生鸡的依赖问题。所以需要将 DDL 分成两类，静态 DDL 和动态 DDL。系统 bootstrap 阶段只使用静态 DDL，同时必须在一个事务内完成，而后续所有的操作只允许使用动态 DDL。
 
 ## 引入新概念：
-*   元数据记录：为了简化设计，引入 system database 和 system table 来记录这些信息。
-*   State：根据 F1 的异步变更 schema 过程，中间引入了一些状态，这些状态要和 column，index， table 以及 database 绑定， state 主要包括 public， writeOnly， deleteOnly， delete reorganization， none。前面的顺序是在删除操作的时候的，创建操作的状态与它相反，delete reorganization 改为 write reorganization，虽然都是 reorganization 状态，但是由于可见级别是有很大区别的，所以将其分为两种状态标记。
-*   Lease：同一时刻系统所有节点中 schema 最多有两个不同的版本，即最多有两种不同状态。正因为如此，一个租期内每个正常的节点都会自动加载 schema 的信息，如果不能在租期内正常加载，此节点会自动退出整个系统。那么要确保整个系统的所有节点都已经从某个状态更新到下个状态需要 2 倍的租期时间。此外，必要的事务允许直接加载 schema 信息。
-*   Job： 每个单独的 DDL 操作可看做一个 job。在一个 DDL 操作开始时，会将此操作封装成一个 job 并存放到 job queue，等此操作完成时，会将此 job 从 job queue 删除，并在存入 history job queue，便于查看历史 job。
-*   Worker：每个节点（这里便于理解可以这么认为，实际上是看一个节点上启动的 store 个数）都有一个 worker 用来处理 job。
-*   Owner：整个系统只有一个节点的worker能当选 owner 角色，每个节点都可能当选这个角色，当选 owner 后 worker 才有处理 job 的权利。owner 这个角色是有任期，owner 的信息会存储在 store 中。通过获取的 ownerID 当前如果为空，或者当前的 owner 超过了任期来当选 owner。在租期内这个用来确保整个系统同一时间只有一个节点在处理 schema 变更。
-*   Background operations：后台操作主要用于删除的优化操作，跟前面的 worker 处理 job 机制很像。所以引入了 background job， background job queue， background job history queue， background worker 和 background owner，它们的功能跟上面提到的角色功能一一对应，这里就不作详细介绍。
+*   **元数据记录**：为了简化设计，引入 system database 和 system table 来记录这些信息。
+*   **State**：根据 F1 的异步变更 schema 过程，中间引入了一些状态，这些状态要和 column，index， table 以及 database 绑定， state 主要包括 public， writeOnly， deleteOnly， delete reorganization， none。前面的顺序是在删除操作的时候的，创建操作的状态与它相反，delete reorganization 改为 write reorganization，虽然都是 reorganization 状态，但是由于可见级别是有很大区别的，所以将其分为两种状态标记。
+*   **Lease**：同一时刻系统所有节点中 schema 最多有两个不同的版本，即最多有两种不同状态。正因为如此，一个租期内每个正常的节点都会自动加载 schema 的信息，如果不能在租期内正常加载，此节点会自动退出整个系统。那么要确保整个系统的所有节点都已经从某个状态更新到下个状态需要 2 倍的租期时间。此外，必要的事务允许直接加载 schema 信息。
+*   **Job**： 每个单独的 DDL 操作可看做一个 job。在一个 DDL 操作开始时，会将此操作封装成一个 job 并存放到 job queue，等此操作完成时，会将此 job 从 job queue 删除，并在存入 history job queue，便于查看历史 job。
+*   **Worker**：每个节点（这里便于理解可以这么认为，实际上是看一个节点上启动的 store 个数）都有一个 worker 用来处理 job。
+*   **Owner**：整个系统只有一个节点的worker能当选 owner 角色，每个节点都可能当选这个角色，当选 owner 后 worker 才有处理 job 的权利。owner 这个角色是有任期，owner 的信息会存储在 store 中。通过获取的 ownerID 当前如果为空，或者当前的 owner 超过了任期来当选 owner。在租期内这个用来确保整个系统同一时间只有一个节点在处理 schema 变更。
+*   **Background operations**：后台操作主要用于删除的优化操作，跟前面的 worker 处理 job 机制很像。所以引入了 background job， background job queue， background job history queue， background worker 和 background owner，它们的功能跟上面提到的角色功能一一对应，这里就不作详细介绍。
 
 ## 变更流程
   通过上面的章节可以了解动态变更 schema 的基本概念，本章节会将这些基本点串联成具体的变更流程。这里在讲述流程的时候会对 MySQL Client 端， MySQL Protocol 层和 KV 层的操作也会一笔带过，只介绍 TiDB SQL 层中处理异步变更 schema 的流程。
@@ -24,13 +24,13 @@
 ![图1 结构流程图](1.jpg)
 
 #### 模块
-*   TiDB Server：包含了 TiDB 的 MySQL Protocol 层和 TiDB SQL 层，图中主要描述的是 TiDB SQL 层对动态变更 Schema 涉及的基本模块。
-*   load schema：是在每个节点（这个模块跟之前提到的 worker 一样，便于理解可以这样认为）启动时创建的一个 gorountine， 用于在到达每个租期时间后去加载 schema，如果某个节点加载失败 TiDB Server 将会自动挂掉。此处加载失败包括加载超时。
-*   start job：是在 TiDB SQL 层接收到请求后，给 job 分配 ID 并将之存入 KV 层，之后等待 job 处理完成后返回给上层，汇报处理结果。
-*   worker：每个节点起一个处理 job 的 goroutine，它会定期检查是否有可以处理的 job。 它在得到本节点上 start job 模块通知后，也会直接去检查是否有可以处理的 job 。
-*   owner：可以认为是一个角色，信息存储在 KV 层，其中包括记录当前当选此角色的节点信息。
-*   job queue：是一个存放 job 的队列，存储在 KV 层，逻辑上整个系统只有一个。
-*   job history queue：是一个存放已经处理完成的 job 的队列，存储在 KV 层，逻辑上整个系统只有一个。
+*   **TiDB Server**：包含了 TiDB 的 MySQL Protocol 层和 TiDB SQL 层，图中主要描述的是 TiDB SQL 层对动态变更 Schema 涉及的基本模块。
+*   **load schema**：是在每个节点（这个模块跟之前提到的 worker 一样，便于理解可以这样认为）启动时创建的一个 gorountine， 用于在到达每个租期时间后去加载 schema，如果某个节点加载失败 TiDB Server 将会自动挂掉。此处加载失败包括加载超时。
+*   **start job**：是在 TiDB SQL 层接收到请求后，给 job 分配 ID 并将之存入 KV 层，之后等待 job 处理完成后返回给上层，汇报处理结果。
+*   **worker**：每个节点起一个处理 job 的 goroutine，它会定期检查是否有可以处理的 job。 它在得到本节点上 start job 模块通知后，也会直接去检查是否有可以处理的 job 。
+*   **owner**：可以认为是一个角色，信息存储在 KV 层，其中包括记录当前当选此角色的节点信息。
+*   **job queue**：是一个存放 job 的队列，存储在 KV 层，逻辑上整个系统只有一个。
+*   **job history queue**：是一个存放已经处理完成的 job 的队列，存储在 KV 层，逻辑上整个系统只有一个。
 
 #### 基本流程
   本小节描述的是动态 DDL 操作整体的一个流程，会忽略实现细节，只对请求进入到每个模块流向的介绍。如下图 2 展示的是在 TiDB Server 1 中涉及的流程，图 3 展示的是在 TiDB Server 2 中涉及的流程。
@@ -108,8 +108,8 @@ start job 的定时检查触发后，会检查 job history queue 是否有之前
 这相对原来设计的主要有两点不同，下面介绍下做如此优化是否对数据完整性和一致性有影响。  
 *   将删除具体数据这个操作异步处理了。因为在把数据放到后台删除前，此数据表（假设这里执行的是删除表操作，后面提到也这么假设）的元数据已经删除，对外已经不能访问到此表了，那么对于它们下面的具体数据就更不能访问了。这里可能有人会有疑问那异步删除模块是怎么访问的具体数据的，将元数据事先存在 job 信息中，就这么简单。只要保证先删除元数据（保证此事务提交成功）再异步删除具体数据是不会有问题的。
 *   去掉了 delete reorganization 状态。本来 delete only 以及之前的状态都没做修改所以必然是没问题的，那么就是考虑 none 这个状态，即当整个系统由于接到变更信息先后不同处于 delete only 以及 none 这两个状态。那么就分析在这个状态下有客户端希望对此表进行一些操作。  
-&emsp;&emsp; *   客户端访问表处于 none 状态的 TiDB Server。这个其实更没有做优化前是一致的，即访问不到此表，这边不过多解释。  
-&emsp;&emsp; *   客户端访问表处于 delete only 状态的 TiDB Server。此时客户端对此表做读写操作会失败，因为 delete only 状态对它们都不可见。
+ *   客户端访问表处于 none 状态的 TiDB Server。这个其实更没有做优化前是一致的，即访问不到此表，这边不过多解释。  
+ *   客户端访问表处于 delete only 状态的 TiDB Server。此时客户端对此表做读写操作会失败，因为 delete only 状态对它们都不可见。
 
 ###### 实现
   此优化对于原先的代码逻辑基本没有变化，除了对于删除操作（目前还只是删除数据库和表操作）在其处于 delete only 状态时，就会把元数据删除，而对起表中具体数据的删除则推迟到后台运行，然后结束 DDL job。放到后台运行的任务的流程跟之前处理任务的流程类似，详细过程如下：
