@@ -1,7 +1,7 @@
 # TiDB 的异步 schema 变更实现
 
 ## 背景
-  现在一般数据库在进行 DDL 操作操作 DDL 变更时都会锁表，导致线上对此表的 DML 操作全部进入等待状态（有些数据支持读操作，但是也以消耗大量内存为代价），即很多涉及此表的业务都处于阻塞状态，表越大，影响时间越久。这使得 DBA 在做此类操作前要做足准备，然后挑个天时地利人和的时间段执行。为此，架构师们在设计整个系统的时候都会很慎重的考虑表结构，希望将来不用再修改。，但是未来的业务需求往往是不可预估的，所以 DDL 操作无法完全避免。由此可见原先的机制处理 DDL 操作是令许多人都头疼的事情。，那么本文将会来介绍 TiDB 是如何解决此问题的。
+  现在一般数据库在进行 DDL 操作时都会锁表，导致线上对此表的 DML 操作全部进入等待状态（有些数据支持读操作，但是也以消耗大量内存为代价），即很多涉及此表的业务都处于阻塞状态，表越大，影响时间越久。这使得 DBA 在做此类操作前要做足准备，然后挑个天时地利人和的时间段执行。为此，架构师们在设计整个系统的时候都会很慎重的考虑表结构，希望将来不用再修改。但是未来的业务需求往往是不可预估的，所以 DDL 操作无法完全避免。由此可见原先的机制处理 DDL 操作是令许多人都头疼的事情。本文将会介绍 TiDB 是如何解决此问题的。
 
 ## 解决方案
   根据 Google F1 的在线异步变更 schema 算法实现，并做了一些简单优化。为了简化设计，整个系统同一时刻只允许一个节点做 schema 变更。这里先说明一下，本文不会讲述 Google F1 schema 算法推导过程，对此算法不了解的可以直接阅读论文原文或者异步 schema 变更。
@@ -19,11 +19,11 @@
 *   Background operations：后台操作主要用于删除的优化操作，跟前面的 worker 处理 job 机制很像。所以引入了 background job， background job queue， background job history queue， background worker 和 background owner，它们的功能跟上面提到的角色功能一一对应，这里就不作详细介绍。
 
 ## 变更流程
-	通过上面的章节可以了解动态变更 schema 的基本概念，本章节会将这些基本点串联成具体的变更流程。这里在讲述流程的时候会对 MySQL Client 端， MySQL Protocol 层和 KV 层的操作也会一笔带过，只介绍 TiDB SQL 层中处理异步变更 schema 的流程。
-	基本流程如图1，下面将详细介绍每个模块以及具体流程。
-图1 结构流程图(1.jpg)
+  通过上面的章节可以了解动态变更 schema 的基本概念，本章节会将这些基本点串联成具体的变更流程。这里在讲述流程的时候会对 MySQL Client 端， MySQL Protocol 层和 KV 层的操作也会一笔带过，只介绍 TiDB SQL 层中处理异步变更 schema 的流程。
+  基本流程如图1，下面将详细介绍每个模块以及具体流程。
+![图1 结构流程图](1.jpg)
 
-### 模块
+#### 模块
 *   TiDB Server：包含了 TiDB 的 MySQL Protocol 层和 TiDB SQL 层，图中主要描述的是 TiDB SQL 层对动态变更 Schema 涉及的基本模块。
 *   load schema：是在每个节点（这个模块跟之前提到的 worker 一样，便于理解可以这样认为）启动时创建的一个 gorountine， 用于在到达每个租期时间后去加载 schema，如果某个节点加载失败 TiDB Server 将会自动挂掉。此处加载失败包括加载超时。
 *   start job：是在 TiDB SQL 层接收到请求后，给 job 分配 ID 并将之存入 KV 层，之后等待 job 处理完成后返回给上层，汇报处理结果。
@@ -32,12 +32,12 @@
 *   job queue：是一个存放 job 的队列，存储在 KV 层，逻辑上整个系统只有一个。
 *   job history queue：是一个存放已经处理完成的 job 的队列，存储在 KV 层，逻辑上整个系统只有一个。
 
-### 基本流程
+#### 基本流程
   本小节描述的是动态 DDL 操作整体的一个流程，会忽略实现细节，只对请求进入到每个模块流向的介绍。如下图2展示的是在 TiDB Server 1 中涉及的流程，图3展示的是在 TiDB Server 2 中涉及的流程。
-图2 TiDB Server 1流程图(2.jpg)
+[图2 TiDB Server 1流程图](2.jpg)
 
 
-图3 TiDB Server 2流程图(3.jpg)
+[图3 TiDB Server 2流程图](3.jpg)
 
 1.   MySQL Client 发送给 TiDB Server 一个更改 DDL 的 SQL 语句请求。
 2.   某个 TiDB Server 收到请求（MySQL Protocol 层收到请求进行解析优化），然后到达 TiDB SQL 层进行执行。这步骤主要是在 TiDB SQL 层接到请求后，会起个 start job 的模块根据请求将其封装成特定的 DDL job，然后将此 job 存储到 KV 层， 并通知自己的  worker 有 job 可以执行。
@@ -46,10 +46,10 @@
 5.   之前封装 job 的 start job 模块会定期去 job history queue 查看是否有之前放进去的 job 对应 ID 的 job，如果有则整个 DDL 操作结束。
 6.   TiDB Server 将 response 返回 MySQL Client。
 
-### 详细流程
-	本小节会详细介绍 worker 处理 job 的整个流程，其中会以在表中添加新列为例，具体流程如图4。考虑到与前面章节的连续性，图4可以理解为是图2和图3的展开描绘。
+#### 详细流程
+  本小节会详细介绍 worker 处理 job 的整个流程，其中会以在表中添加新列为例，具体流程如图4。考虑到与前面章节的连续性，图4可以理解为是图2和图3的展开描绘。
 
-图4 add column 流程图(4.jpg)
+[图4 add column 流程图](4.jpg)
 
 便于在之后介绍中获取信息的方式，此处贴出了 job 的结构。
 ```go
@@ -74,11 +74,11 @@
 	}
 ```
 
-### TiDB Server 1 流程
+###### TiDB Server 1 流程
 1.   start job 给 start worker 传递了 job 已经准备完成的信号。
 2.   然后 worker 开启一个事务，检查自己是否是 owner 角色，结果发现不是 owner 角色（此处跟先前的章节保持一致，假设此节点 worker 不是 owner 角色），则提交事务退出处理 job 的循环，回到 start worker 等待信号的循环。
 
-### TiDB Server 2 流程
+###### TiDB Server 2 流程
 1.   start worker 中的定时器到达时间。
 2.   开启一个事务，检查发现本节点为 owner 角色。
 3.   从 KV 层获取第一个 job（假设就是 TiDB Server 1 之前放入的 job），判断此 job 的类型并对它做相应的处理。
@@ -101,21 +101,21 @@
 13.   因为 job 状态已经 finish，将此 job 从 job queue 中移除并放入 job history queue 中。
 14.   执行步骤8，与之前的步骤一样12， 13， 14和15在一个事务中  。
 
-### TiDB Server 1 流程
-start job 的定时检查触发后，会检查 job history queue 是否有之前自己放入 job queue 中的 job（通过 jobID），如果有则此 DDL 操作在 TiDB SQL 完成，上抛到 MySQL Protocol 层，最后返回给 Client， 结束这个操作。
-优化
-	对删除数据库，删除数据表等减少一个状态，即2倍 lease 的等待时间，以及删除数据库或者数据表中大量数据所消耗的时间。原本对于删除操作的状态变化是 public -> write only -> delete only -> delete reorganization -> none，优化的处理是去掉 delete reorganization 状态，并把此状态需要处理的元数据的操作放到 delete only 状态时，把具体删除数据的操作放到后台处理，然后直接把状态标为 none。
-这相对原来设计的主要有两点不同，下面介绍下做如此优化是否对数据完整性和一致性有影响。
-将删除具体数据这个操作异步处理了。因为在把数据放到后台删除前，此数据表（假设这里执行的是删除表操作，后面提到也这么假设）的元数据已经删除，对外已经不能访问到此表了，那么对于它们下面的具体数据就更不能访问了。这里可能有人会有疑问那异步删除模块是怎么访问的具体数据的，将元数据事先存在 job 信息中，就这么简单。只要保证先删除元数据（保证此事务提交成功）再异步删除具体数据是不会有问题的。
-去掉了 delete reorganization 状态。本来 delete only 以及之前的状态都没做修改所以必然是没问题的，那么就是考虑 none 这个状态，即当整个系统由于接到变更信息先后不同处于 delete only 以及 none 这两个状态。那么就分析在这个状态下有客户端希望对此表进行一些操作。
-客户端访问表处于 none 状态的 TiDB Server。这个其实更没有做优化前是一致的，即访问不到此表，这边不过多解释。
-客户端访问表处于 delete only 状态的 TiDB Server。此时客户端对此表做读写操作会失败，因为 delete only 状态对它们都不可见。
-实现
-	此优化对于原先的代码逻辑基本没有变化，除了对于删除操作（目前还只是删除数据库和表操作）在其处于 delete only 状态时，就会把元数据删除，而对起表中具体数据的删除则推迟到后台运行，然后结束 DDL job。放到后台运行的任务的流程跟之前处理任务的流程类似，详细过程如下：
-在图4中判定 finish 操作为 true 后，判断如果是可以放在后台运行（暂时还只是删除数据库和表的任务），那么将其封装成 background job 放入 background job queue， 并通知本机后台的 worker 将其处理。
-后台 job 也有对应的 owner，假设本机的 backgroundworker 就是 background owner 角色，那么他将从 background job queue 中取出第一个 background job， 然后执行对应类型的操作（删除表中具体的数据）。
+###### TiDB Server 1 流程
+start job 的定时检查触发后，会检查 job history queue 是否有之前自己放入 job queue 中的 job（通过 jobID），如果有则此 DDL 操作在 TiDB SQL 完成，上抛到 MySQL Protocol 层，最后返回给 Client， 结束这个操作。  
+#### 优化
+对删除数据库，删除数据表等减少一个状态，即2倍 lease 的等待时间，以及删除数据库或者数据表中大量数据所消耗的时间。原本对于删除操作的状态变化是 public -> write only -> delete only -> delete reorganization -> none，优化的处理是去掉 delete reorganization 状态，并把此状态需要处理的元数据的操作放到 delete only 状态时，把具体删除数据的操作放到后台处理，然后直接把状态标为 none。  
+这相对原来设计的主要有两点不同，下面介绍下做如此优化是否对数据完整性和一致性有影响。  
+*   将删除具体数据这个操作异步处理了。因为在把数据放到后台删除前，此数据表（假设这里执行的是删除表操作，后面提到也这么假设）的元数据已经删除，对外已经不能访问到此表了，那么对于它们下面的具体数据就更不能访问了。这里可能有人会有疑问那异步删除模块是怎么访问的具体数据的，将元数据事先存在 job 信息中，就这么简单。只要保证先删除元数据（保证此事务提交成功）再异步删除具体数据是不会有问题的。
+*   去掉了 delete reorganization 状态。本来 delete only 以及之前的状态都没做修改所以必然是没问题的，那么就是考虑 none 这个状态，即当整个系统由于接到变更信息先后不同处于 delete only 以及 none 这两个状态。那么就分析在这个状态下有客户端希望对此表进行一些操作。
+*   客户端访问表处于 none 状态的 TiDB Server。这个其实更没有做优化前是一致的，即访问不到此表，这边不过多解释。
+*   客户端访问表处于 delete only 状态的 TiDB Server。此时客户端对此表做读写操作会失败，因为 delete only 状态对它们都不可见。
+###### 实现
+  此优化对于原先的代码逻辑基本没有变化，除了对于删除操作（目前还只是删除数据库和表操作）在其处于 delete only 状态时，就会把元数据删除，而对起表中具体数据的删除则推迟到后台运行，然后结束 DDL job。放到后台运行的任务的流程跟之前处理任务的流程类似，详细过程如下：
+1.   在图4中判定 finish 操作为 true 后，判断如果是可以放在后台运行（暂时还只是删除数据库和表的任务），那么将其封装成 background job 放入 background job queue， 并通知本机后台的 worker 将其处理。
+2.   后台 job 也有对应的 owner，假设本机的 backgroundworker 就是 background owner 角色，那么他将从 background job queue 中取出第一个 background job， 然后执行对应类型的操作（删除表中具体的数据）。
 如果执行完成，那么从 background job queue 中将此 job 删除，并放入 background job history queue 中。
-其中 2， 3在一个事务中执行。
+3.   其中 2， 3在一个事务中执行。
 
 ## 总结
   以上内容是 TiDB 的异步 schema 变更实现的基本内容介绍，可能有些流程细节没有讲解清晰，如果对本人的描述或者对实现有疑问的欢迎到 issues 讨论。
